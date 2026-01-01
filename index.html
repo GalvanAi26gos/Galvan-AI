@@ -16,6 +16,7 @@
     object-src 'none';
     base-uri 'self';
     form-action 'self';
+    upgrade-insecure-requests;
 ">
 <meta http-equiv="X-Content-Type-Options" content="nosniff">
 <meta http-equiv="X-Frame-Options" content="DENY">
@@ -1668,7 +1669,7 @@ const colorPaletteOptionsContainer = document.getElementById('color-palette-opti
 let userPromptsHistory = [];
 let promptHistoryIndex = -1;
 const historyHub = document.getElementById('galvan-history-hub');
-const API_KEY = "AIzaSyDNnHcliJ2T4--B1mBL8k8iowqFKQchvP4";
+const API_KEY = "AIzaSyAImYV6p5Z3TEkTD21U3_Hdhlhu-la4oYQ";
 const IS_API_KEY_VALID = API_KEY && API_KEY !== "YOUR_API_KEY_HERE" && API_KEY.length > 30;
 const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${API_KEY}`;
 const STORAGE_KEY = 'galvanAi_v30_settings';
@@ -1748,25 +1749,30 @@ const getDefaultSettings = () => ({
   customSuggestions: [],
   chatHistory: []
 });
-
-const loadSettings = () => {
-  if (!isLocalStorageAvailable) {
-    appSettings = getDefaultSettings();
-    return;
-  }
-  try {
-    const storedSettings = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    appSettings = { ...getDefaultSettings(), ...storedSettings };
-  } catch (e) {
-    appSettings = getDefaultSettings();
-  }
+const loadSettings = async () => {
+    if (!isLocalStorageAvailable) {
+        appSettings = getDefaultSettings();
+        return;
+    }
+    try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        let storedSettings;
+        if (raw && !raw.startsWith('{')) {
+            storedSettings = await galvanVault.decrypt(raw);
+        } else {
+            storedSettings = JSON.parse(raw);
+        }
+        appSettings = { ...getDefaultSettings(), ...storedSettings };
+    } catch (e) {
+        appSettings = getDefaultSettings();
+    }
 };
 
-const saveSettings = () => {
-  if (!isLocalStorageAvailable) return;
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(appSettings));
+const saveSettings = async () => {
+    if (!isLocalStorageAvailable) return;
+    const encrypted = await galvanVault.encrypt(appSettings);
+    localStorage.setItem(STORAGE_KEY, encrypted);
 };
-
 const getUserData = (key) => appSettings[key];
 const setUserData = (key, value) => {
   appSettings[key] = value;
@@ -2135,8 +2141,35 @@ const saveFullChatHistory = () => {
 };
 
 function escapeHtml(unsafe) {
-  if (typeof unsafe !== 'string') return '';
-  return unsafe.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+    if (typeof unsafe !== 'string') return '';
+    const temp = document.createElement('div');
+    temp.textContent = unsafe;
+    let sanitized = temp.innerHTML;
+    sanitized = sanitized
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;")
+        .replace(/`/g, "&#96;")
+        .replace(/\(/g, "&#40;")
+        .replace(/\)/g, "&#41;")
+        .replace(/=/g, "&#61;");
+    const dangerousPatterns = [
+        /javascript:/gi, 
+        /vbscript:/gi, 
+        /data:/gi, 
+        /on\w+=/gi, 
+        /formaction/gi, 
+        /xlink:href/gi,
+        /object/gi,
+        /embed/gi,
+        /iframe/gi
+    ];
+    dangerousPatterns.forEach(pattern => {
+        sanitized = sanitized.replace(pattern, "blocked:");
+    });
+    return sanitized;
 }
 
 function parseMarkdownToHTML(text) {
@@ -3697,38 +3730,69 @@ document.addEventListener('click', (e) => {
   if (!attachmentMenuEl.contains(e.target) && !finalAddFileBtn.contains(e.target)) closeAttachmentMenu();
 });
 
-const processSelectedFile = (file) => {
-  if (!file) return;
-  const MAX_FILE_SIZE = 15 * 1024 * 1024;
-  if (file.size > MAX_FILE_SIZE) {
-   return;
-  }
-  const isImage = file.type.startsWith("image/");
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    const base64String = e.target.result.split(",")[1];
-    const safeFileName = file.name.replace(/</g, "<").replace(/>/g, ">");
-    if (fileNameElement) fileNameElement.textContent = safeFileName;
-    if (isImage) {
-      filePreviewImage.src = e.target.result;
-      filePreviewImage.style.display = 'block';
-      filePreviewIconSVG.style.display = 'none';
-    } else {
-      filePreviewIconSVG.innerHTML = getFileIconSVG(file.type, file.name);
-      filePreviewImage.style.display = 'none';
-      filePreviewIconSVG.style.display = 'inline-block';
-    }
-    fileUploadWrapper.classList.add("active");
-    userData.file = { fileName: file.name, data: base64String, mime_type: file.type || 'application/octet-stream', isImage };
-    if (!body.classList.contains("bot-responding")) sendBtn.disabled = false;
-    fileInput.value = "";
-    cameraInput.value = "";
-    galleryInput.value = "";
-  };
-  reader.readAsDataURL(file);
-  closeAttachmentMenu();
+const verifyFileSignature = (file) => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = function(e) {
+            if (e.target.readyState === FileReader.DONE) {
+                const arr = (new Uint8Array(e.target.result)).subarray(0, 4);
+                let header = "";
+                for(let i = 0; i < arr.length; i++) {
+                    header += arr[i].toString(16);
+                }
+                const validHeaders = ["89504e47", "ffd8ff", "25504446", "504b0304", "47494638"];
+                const isValid = validHeaders.some(h => header.startsWith(h) || header.startsWith(h.substring(0,4)));
+                if (!isValid && (file.type.startsWith('text/') || file.name.endsWith('.csv'))) {
+                    resolve(true);
+                } else if (isValid) {
+                    resolve(true);
+                } else {
+                    reject("Security Alert: File signature mismatch. This file may be disguised malware.");
+                }
+            }
+        };
+        reader.readAsArrayBuffer(file.slice(0, 4));
+    });
 };
 
+const processSelectedFile = async (file) => {
+    if (!file) return;
+    const MAX_FILE_SIZE = 15 * 1024 * 1024;
+    if (file.size > MAX_FILE_SIZE) {
+        alert("Security: File too large. Potential DoS vector.");
+        return;
+    }
+    try {
+        await verifyFileSignature(file);
+    } catch (error) {
+        alert(error);
+        return;
+    }
+    const isImage = file.type.startsWith("image/");
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        const base64String = e.target.result.split(",")[1];
+        const safeFileName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+        if (fileNameElement) fileNameElement.textContent = safeFileName;
+        if (isImage) {
+            filePreviewImage.src = e.target.result;
+            filePreviewImage.style.display = 'block';
+            filePreviewIconSVG.style.display = 'none';
+        } else {
+            filePreviewIconSVG.innerHTML = getFileIconSVG(file.type, safeFileName);
+            filePreviewImage.style.display = 'none';
+            filePreviewIconSVG.style.display = 'inline-block';
+        }
+        fileUploadWrapper.classList.add("active");
+        userData.file = { fileName: safeFileName, data: base64String, mime_type: file.type || 'application/octet-stream', isImage };
+        if (!body.classList.contains("bot-responding")) sendBtn.disabled = false;
+        fileInput.value = "";
+        cameraInput.value = "";
+        galleryInput.value = "";
+    };
+    reader.readAsDataURL(file);
+    closeAttachmentMenu();
+};
 const allAttachInputs = [fileInput, cameraInput, galleryInput];
 allAttachInputs.forEach(input => {
   if (input) {
@@ -6268,4 +6332,269 @@ this.wrapper.classList.add('show-basic');
     }
 
 })();
+
+
+
+
+
+
+
+
+
+
+
+
+/* --- Advanced Security --- */
+/* --- Advanced Security --- */
+/* --- Advanced Security --- */
+
+class GalvanVault {
+    constructor() {
+        this.key = null;
+        this.init();
+    }
+    async init() {
+        let keyData = localStorage.getItem('galvan_device_key');
+        if (!keyData) {
+            const key = await window.crypto.subtle.generateKey(
+                { name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]
+            );
+            const exported = await window.crypto.subtle.exportKey("jwk", key);
+            localStorage.setItem('galvan_device_key', JSON.stringify(exported));
+            this.key = key;
+        } else {
+            this.key = await window.crypto.subtle.importKey(
+                "jwk", JSON.parse(keyData), { name: "AES-GCM" }, true, ["encrypt", "decrypt"]
+            );
+        }
+    }
+    async encrypt(data) {
+        if (!this.key) await this.init();
+        const encoded = new TextEncoder().encode(JSON.stringify(data));
+        const iv = window.crypto.getRandomValues(new Uint8Array(12));
+        const encrypted = await window.crypto.subtle.encrypt(
+            { name: "AES-GCM", iv: iv }, this.key, encoded
+        );
+        const encryptedArray = new Uint8Array(encrypted);
+        const combined = new Uint8Array(iv.length + encryptedArray.length);
+        combined.set(iv);
+        combined.set(encryptedArray, iv.length);
+        return btoa(String.fromCharCode.apply(null, combined));
+    }
+    async decrypt(encryptedString) {
+        if (!this.key) await this.init();
+        try {
+            const combined = new Uint8Array(atob(encryptedString).split("").map(c => c.charCodeAt(0)));
+            const iv = combined.slice(0, 12);
+            const data = combined.slice(12);
+            const decrypted = await window.crypto.subtle.decrypt(
+                { name: "AES-GCM", iv: iv }, this.key, data
+            );
+            return JSON.parse(new TextDecoder().decode(decrypted));
+        } catch (e) {
+            return null;
+        }
+    }
+}
+const galvanVault = new GalvanVault();
+
+
+
+
+/* --- Advanced Security --- */
+/* --- Advanced Security --- */
+/* --- Advanced Security --- */
+(function() {
+    const criticalNodes = ['galvan-lock-hub', 'galvan-app-blocker'];
+    
+    const observer = new MutationObserver((mutations) => {
+        mutations.forEach((mutation) => {
+            if (mutation.type === 'childList') {
+                mutation.removedNodes.forEach((node) => {
+                    if (node.id && criticalNodes.includes(node.id)) {
+                        document.body.innerHTML = ''; 
+                        alert("SECURITY ALERT: Integrity violation detected. System reload initiated.");
+                        window.location.reload();
+                    }
+                });
+            }
+            if (mutation.type === 'attributes' && mutation.attributeName === 'class') {
+                if (localStorage.getItem('galvan_secure_pin_v1') && 
+                    !state.isLocked && 
+                    !document.body.classList.contains('app-locked') && 
+                    !document.body.classList.contains('app-ready')) {
+                }
+            }
+        });
+    });
+
+    observer.observe(document.body, { childList: true, attributes: true, subtree: false });
+    
+    document.addEventListener('contextmenu', event => event.preventDefault());
+    document.onkeydown = function(e) {
+        if(e.keyCode == 123) { return false; } 
+        if(e.ctrlKey && e.shiftKey && e.keyCode == 'I'.charCodeAt(0)) { return false; }
+        if(e.ctrlKey && e.shiftKey && e.keyCode == 'C'.charCodeAt(0)) { return false; } 
+        if(e.ctrlKey && e.shiftKey && e.keyCode == 'J'.charCodeAt(0)) { return false; }
+        if(e.ctrlKey && e.keyCode == 'U'.charCodeAt(0)) { return false; }
+    }
+})();
+
+/* --- Advanced Security --- */
+/* --- Advanced Security --- */
+/* --- Advanced Security --- */
+
+(function() {
+    const CONFIG = {
+        IDLE_TIMEOUT_SECONDS: 120,
+        CHECK_INTERVAL_MS: 1000,
+        DEBUG_THRESHOLD_MS: 100
+    };
+    
+    let idleTimer = 0;
+    
+    const resetIdle = () => { idleTimer = 0; };
+    ['mousemove', 'keydown', 'touchstart', 'scroll'].forEach(evt => 
+        document.addEventListener(evt, resetIdle, { passive: true })
+    );
+
+    setInterval(() => {
+        const start = performance.now();
+        debugger; 
+        const end = performance.now();
+        if (end - start > CONFIG.DEBUG_THRESHOLD_MS) {
+            document.body.innerHTML = ''; 
+            window.location.reload(); 
+        }
+        
+        idleTimer++;
+        if (idleTimer >= CONFIG.IDLE_TIMEOUT_SECONDS) {
+            const isLocked = document.body.classList.contains('app-locked');
+            if (!isLocked && typeof lockApp === 'function') {
+                if (localStorage.getItem('galvan_secure_pin_v1')) {
+                    lockApp();
+                }
+            }
+        }
+    }, CONFIG.CHECK_INTERVAL_MS);
+
+    document.addEventListener('contextmenu', e => e.preventDefault());
+    
+    document.addEventListener('keydown', e => {
+        if (
+            e.keyCode === 123 || 
+            (e.ctrlKey && e.shiftKey && (e.keyCode === 73 || e.keyCode === 74 || e.keyCode === 67)) || 
+            (e.ctrlKey && e.keyCode === 85)
+        ) {
+            e.preventDefault();
+            return false;
+        }
+    });
+
+    const observer = new MutationObserver(mutations => {
+        mutations.forEach(mutation => {
+            if (mutation.type === 'childList') {
+                mutation.removedNodes.forEach(node => {
+                    if (node.id === 'galvan-lock-hub' || node.id === 'galvan-app-blocker') {
+                        document.body.style.display = 'none';
+                        window.location.reload();
+                    }
+                });
+            }
+            if (mutation.type === 'attributes' && mutation.attributeName === 'class') {
+                if (document.body.classList.contains('app-locked')) {
+                     const blocker = document.getElementById('galvan-app-blocker');
+                     if (blocker && getComputedStyle(blocker).display === 'none') {
+                         window.location.reload();
+                     }
+                }
+            }
+        });
+    });
+    
+    observer.observe(document.body, { childList: true, attributes: true, subtree: true });
+})();
+
+/* ---Super Duper Advanced Security --- */
+/* ---Super Duper Advanced Security --- */
+/* ---Super Duper Advanced Security --- */
+/* --- SECURITY MODULE: SELF-INTEGRITY CHECKSUM --- */
+
+(function() {
+    class GalvanVault {
+        constructor() { this.key = null; this.init(); }
+        async init() {
+            let k = localStorage.getItem('galvan_device_key');
+            if (!k) {
+                const newK = await window.crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+                localStorage.setItem('galvan_device_key', JSON.stringify(await window.crypto.subtle.exportKey("jwk", newK)));
+                this.key = newK;
+            } else {
+                this.key = await window.crypto.subtle.importKey("jwk", JSON.parse(k), { name: "AES-GCM" }, true, ["encrypt", "decrypt"]);
+            }
+        }
+        async encrypt(d) {
+            if (!this.key) await this.init();
+            const iv = window.crypto.getRandomValues(new Uint8Array(12));
+            const enc = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, this.key, new TextEncoder().encode(JSON.stringify(d)));
+            return btoa(String.fromCharCode(...new Uint8Array(iv), ...new Uint8Array(enc)));
+        }
+        async decrypt(s) {
+            if (!this.key) await this.init();
+            try {
+                const b = new Uint8Array(atob(s).split("").map(c => c.charCodeAt(0)));
+                return JSON.parse(new TextDecoder().decode(await window.crypto.subtle.decrypt({ name: "AES-GCM", iv: b.slice(0, 12) }, this.key, b.slice(12))));
+            } catch (e) { return null; } 
+        }
+    }
+    const secureStorage = new GalvanVault();
+
+    (function() {
+        const C = { T: 120, I: 1000, D: 100 }; let t = 0;
+        const r = () => t = 0;
+        ['mousemove','keydown','touchstart','scroll'].forEach(e => document.addEventListener(e, r, {passive:true}));
+        
+        setInterval(() => {
+            const s = performance.now(); 
+            debugger; 
+            if (performance.now() - s > C.D) { document.body.innerHTML=''; window.location.reload(); }
+            if (++t >= C.T) {
+                if (!document.body.classList.contains('app-locked') && localStorage.getItem('galvan_secure_pin_v1')) lockApp();
+            }
+        }, C.I);
+
+        document.addEventListener('contextmenu', e => e.preventDefault());
+        document.addEventListener('keydown', e => {
+            if (e.key === 'F12' || (e.ctrlKey && e.shiftKey && ['I','J','C'].includes(e.key)) || (e.ctrlKey && e.key === 'u')) {
+                e.preventDefault(); return false;
+            }
+        });
+        new MutationObserver(ms => ms.forEach(m => {
+            if(m.type==='childList') m.removedNodes.forEach(n => {
+                if(n.id==='galvan-lock-hub' || n.id==='galvan-app-blocker') {
+                    document.body.innerHTML='<h1>SECURITY BREACH</h1>'; window.location.reload();
+                }
+            });
+        })).observe(document.body, {childList:true, subtree:true});
+    })();
+
+    window.verifySig = (f) => new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onloadend = (e) => {
+            const h = Array.from(new Uint8Array(e.target.result).subarray(0,4)).map(b=>b.toString(16)).join('');
+
+            if (["25504446","ffd8ff","89504e47","504b0304","47494638"].some(s=>h.startsWith(s)) || f.type.startsWith('text/') || f.name.endsWith('.csv')) res(true);
+            else rej("Security Alert: Invalid File Signature");
+        };
+        r.readAsArrayBuffer(f.slice(0,4));
+    });
+    window.secureSave = async (k, v) => localStorage.setItem(k, await secureStorage.encrypt(v));
+    window.secureLoad = async (k) => {
+        const raw = localStorage.getItem(k);
+        if(!raw) return null;
+        return raw.startsWith('{') ? JSON.parse(raw) : await secureStorage.decrypt(raw);
+    };
+    console.log("%c GALVAN SECURE KERNEL LOADED ", "background: #000; color: #0f0; font-weight: bold;");
+})();
+
 </script>
